@@ -2,7 +2,6 @@ import os
 import torch
 import pickle
 import math
-from typing import List
 from av2.datasets.motion_forecasting.scenario_serialization import load_argoverse_scenario_parquet
 from av2.map.map_api import ArgoverseStaticMap
 from pathlib import Path
@@ -32,19 +31,20 @@ def load_dataset(dataset_path: str):
     stop_signs = []
     crosswalks = []
     
+    observed_array = []
+    timestep_array = []
+    position_array = []
+    heading_array = []
+    velocity_array = []
+    acceleration_array = []
+    
     for folder in os.listdir(dataset_path):
         folder_path = os.path.join(dataset_path, folder)
         if not os.path.isdir(folder_path):
             continue
         
-        scenario_file = None
-        map_file = None
-        
-        for file in os.listdir(folder_path):
-            if file.endswith('.parquet'):
-                scenario_file = os.path.join(folder_path, file)
-            if file.endswith('.json'):
-                map_file = os.path.join(folder_path, file)
+        scenario_file = next((os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.endswith('.parquet')), None)
+        map_file = next((os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.endswith('.json')), None)
         
         if not scenario_file or not map_file:
             print(f"Skipping folder {folder}: Missing required files")
@@ -60,113 +60,86 @@ def load_dataset(dataset_path: str):
             'num_timestamps': len(scenario.timestamps_ns)
         }
         
-        agent_data = []
-        type_data = []
-        time_data = []
-        orientation_data = []
-        acceleration_data = []
-        
         for track in scenario.tracks:
             prev_velocity = None
             prev_timestep = None
             for state in track.object_states:
-                if state is not None:
-                    agent_data.append([state.position[0], state.position[1], state.velocity[0], state.velocity[1]])
-                    type_data.append(track.object_type.name)
-                    time_data.append(state.timestep)
-                    orientation = math.atan2(state.velocity[1], state.velocity[0]) if state.velocity[0] != 0 or state.velocity[1] != 0 else 0.0
-                    orientation_data.append(orientation)
-                    
-                    if prev_velocity is not None and prev_timestep is not None:
-                        delta_vx = state.velocity[0] - prev_velocity[0]
-                        delta_vy = state.velocity[1] - prev_velocity[1]
-                        delta_t = state.timestep - prev_timestep if state.timestep - prev_timestep > 0 else 1.0
-                        ax = delta_vx / delta_t
-                        ay = delta_vy / delta_t
-                        acceleration_data.append([ax, ay])
-                    else:
-                        acceleration_data.append([0.0, 0.0])
-                    
-                    prev_velocity = state.velocity
-                    prev_timestep = state.timestep
+                if state is None:
+                    continue
+                
+                observed_array.append(state.observed)
+                timestep_array.append(state.timestep)
+                position_array.append([state.position[0], state.position[1]])
+                heading_array.append(math.atan2(state.velocity[1], state.velocity[0]) if state.velocity[0] != 0 or state.velocity[1] != 0 else 0.0)
+                velocity_array.append([state.velocity[0], state.velocity[1]])
+                
+                if prev_velocity and prev_timestep:
+                    delta_vx = state.velocity[0] - prev_velocity[0]
+                    delta_vy = state.velocity[1] - prev_velocity[1]
+                    delta_t = max(state.timestep - prev_timestep, 1.0)
+                    acceleration_array.append([delta_vx / delta_t, delta_vy / delta_t])
+                else:
+                    acceleration_array.append([0.0, 0.0])
+                
+                prev_velocity = state.velocity
+                prev_timestep = state.timestep
         
-        if agent_data:
-            traj_tensor = torch.tensor(agent_data, dtype=torch.float32, device=device)
-            trajectories.append(traj_tensor)
-            agent_types.extend(type_data)
-            timestamps.extend(time_data)
-            orientations.extend(orientation_data)
-            accelerations.extend(acceleration_data)
-            scenario_info['trajectory_rows'] = len(agent_data)
+        road_vector_data = [[lane.polygon_boundary[0][0], lane.polygon_boundary[0][1],
+                             lane.polygon_boundary[-1][0], lane.polygon_boundary[-1][1]]
+                             for lane in map_api.vector_lane_segments.values()]
+        road_attributes = [{'lane_type': lane.lane_type, 'is_intersection': lane.is_intersection}
+                           for lane in map_api.vector_lane_segments.values()]
         
-        road_vector_data = []
-        road_attributes = []
-        for lane_segment in map_api.vector_lane_segments.values():
-            polygon = lane_segment.polygon_boundary
-            start_point = polygon[0]
-            end_point = polygon[-1]
-            road_vector_data.append([start_point[0], start_point[1], end_point[0], end_point[1]])
-            road_attributes.append({
-                'lane_type': lane_segment.lane_type,
-                'is_intersection': lane_segment.is_intersection
-            })
-        
-        for edge_segment in map_api.vector_drivable_areas.values():
-            boundary = edge_segment.area_boundary
-            for i in range(len(boundary) - 1):
-                start_point = boundary[i]
-                end_point = boundary[i + 1]
-                if isinstance(start_point, Point) and isinstance(end_point, Point):
-                    road_edges.append([start_point.x, start_point.y, end_point.x, end_point.y])
+        for edge in map_api.vector_drivable_areas.values():
+            for i in range(len(edge.area_boundary) - 1):
+                start, end = edge.area_boundary[i], edge.area_boundary[i + 1]
+                if isinstance(start, Point) and isinstance(end, Point):
+                    road_edges.append([start.x, start.y, end.x, end.y])
         
         for crossing in map_api.vector_pedestrian_crossings.values():
             edge1_2d, edge2_2d = crossing.get_edges_2d()
-            start_point1 = edge1_2d[0]
-            end_point1 = edge1_2d[1]
-            crosswalks.append([start_point1[0], start_point1[1], end_point1[0], end_point1[1]])
-            start_point2 = edge2_2d[0]
-            end_point2 = edge2_2d[1]
-            crosswalks.append([start_point2[0], start_point2[1], end_point2[0], end_point2[1]])
-
-
+            crosswalks.append([edge1_2d[0][0], edge1_2d[0][1], edge1_2d[1][0], edge1_2d[1][1]])
+            crosswalks.append([edge2_2d[0][0], edge2_2d[0][1], edge2_2d[1][0], edge2_2d[1][1]])
         
         if road_vector_data:
-            road_vector_tensor = torch.tensor(road_vector_data, dtype=torch.float32, device=device)
-            road_vectors.append(road_vector_tensor)
-            scenario_info['road_vector_segments'] = len(road_vector_data)
+            road_vectors.append(torch.tensor(road_vector_data, dtype=torch.float32, device=device))
         
-        scenario_info['road_attributes'] = road_attributes
-        scenario_info['road_edges'] = len(road_edges)
-        scenario_info['stop_signs'] = len(stop_signs)
-        scenario_info['crosswalks'] = len(crosswalks)
+        scenario_info.update({
+            'road_vector_segments': len(road_vector_data),
+            'road_attributes': road_attributes,
+            'road_edges': len(road_edges),
+            'stop_signs': len(stop_signs),
+            'crosswalks': len(crosswalks)
+        })
         dataset_info.append(scenario_info)
         print(f"Processed scenario: {scenario.scenario_id}")
     
-    trajectories_tensor = torch.cat(trajectories, dim=0) if trajectories else torch.empty((0,), device=device)
-    road_vectors_tensor = torch.cat(road_vectors, dim=0) if road_vectors else torch.empty((0, 4), device=device)
-    
-    return trajectories_tensor, road_vectors_tensor, agent_types, timestamps, orientations, accelerations, road_edges, stop_signs, crosswalks, dataset_info
+    return observed_array, timestep_array, position_array, heading_array, velocity_array, acceleration_array, road_vectors, road_edges, stop_signs, crosswalks, dataset_info
 
 def save_combined_dataset(*args):
-    (trajectories, road_vectors, agent_types, timestamps, orientations, accelerations, road_edges, stop_signs, crosswalks, dataset_info) = args
-    for scenario in dataset_info:
-        scenario_id = scenario['scenario_id']
-        print(f"Saving scenario: {scenario_id}")
+    metadata = args[10]
+    
+    for scenario in metadata:
+        scenario_id = scenario.get('scenario_id', 'default')
         combined_data = {
-            'trajectories': trajectories.cpu().numpy(),
-            'road_vectors': road_vectors.cpu().numpy(),
-            'agent_types': agent_types,
-            'timestamps': timestamps,
-            'orientations': orientations,
-            'accelerations': accelerations,
-            'road_edges': road_edges,
-            'stop_signs': stop_signs,
-            'crosswalks': crosswalks,
+            'observed': args[0],
+            'timestep': args[1],
+            'position': args[2],
+            'heading': args[3],
+            'velocity': args[4],
+            'acceleration': args[5],
+            'road_vectors': args[6],
+            'road_edges': args[7],
+            'stop_signs': args[8],
+            'crosswalks': args[9],
             'metadata': scenario
         }
-        with open(os.path.join(OUTPUT_PATH, f'{scenario_id}.pkl'), 'wb') as f:
+        
+        output_file = os.path.join(OUTPUT_PATH, f'{scenario_id}.pkl')
+        with open(output_file, 'wb') as f:
             pickle.dump(combined_data, f)
-        print(f"Saved {scenario_id}.pkl")
+        print(f"Dataset saved successfully as {scenario_id}.pkl")
+
 
 if __name__ == '__main__':
     save_combined_dataset(*load_dataset(DATASET_PATH))
